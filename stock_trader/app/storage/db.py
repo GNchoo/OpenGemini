@@ -1,0 +1,728 @@
+import sqlite3
+from pathlib import Path
+from typing import Any
+import json
+
+
+class IllegalTransitionError(RuntimeError):
+    """Raised when position status transition is not allowed."""
+
+
+class DB:
+    """Lightweight local DB for scaffold E2E tests.
+
+    Note: production target is PostgreSQL (sql/schema_v1_2_3.sql).
+    This sqlite adapter is for quick local integration only.
+    """
+
+    def __init__(self, path: str = "stock_trader.db") -> None:
+        self.path = Path(path)
+        self.conn = sqlite3.connect(self.path)
+        self.conn.row_factory = sqlite3.Row
+
+    def __enter__(self) -> "DB":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        # Close-only context manager: transaction lifecycle is controlled explicitly
+        # by caller via begin()/commit()/rollback().
+        self.close()
+
+    def begin(self) -> None:
+        self.conn.execute("BEGIN")
+
+    def commit(self) -> None:
+        self.conn.commit()
+
+    def rollback(self) -> None:
+        self.conn.rollback()
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def init(self) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            create table if not exists news_events (
+              id integer primary key autoincrement,
+              source text not null,
+              tier integer not null check (tier in (1,2,3)),
+              published_at text not null,
+              title text not null,
+              body text,
+              url text unique,
+              raw_hash text not null unique,
+              ingested_at text default current_timestamp
+            )
+            """
+        )
+        cur.execute(
+            """
+            create table if not exists event_tickers (
+              id integer primary key autoincrement,
+              news_id integer not null,
+              ticker text not null,
+              company_name text,
+              map_confidence real not null,
+              mapping_method text not null,
+              context_snippet text,
+              created_at text default current_timestamp
+            )
+            """
+        )
+        cur.execute(
+            """
+            create table if not exists signal_scores (
+              id integer primary key autoincrement,
+              news_id integer not null,
+              event_ticker_id integer not null,
+              ticker text not null,
+              raw_score real not null,
+              total_score real not null check (total_score >= 0 and total_score <= 100),
+              components text not null,
+              priced_in_flag text not null check (priced_in_flag in ('LOW','MEDIUM','HIGH')),
+              decision text not null check (decision in ('BUY','HOLD','IGNORE','BLOCK')),
+              created_at text default current_timestamp
+            )
+            """
+        )
+        cur.execute(
+            """
+            create table if not exists positions (
+              position_id integer primary key autoincrement,
+              ticker text not null,
+              signal_id integer,
+              status text not null check (status in ('PENDING_ENTRY','OPEN','PARTIAL_EXIT','CLOSED','CANCELLED')),
+              qty real not null default 0,
+              exited_qty real not null default 0,
+              avg_entry_price real,
+              opened_value real,
+              high_watermark real,
+              leverage real not null default 1.0,
+              opened_at text default current_timestamp,
+              closed_at text,
+              exit_reason_code text
+            )
+            """
+        )
+        cur.execute(
+            """
+            create table if not exists orders (
+              id integer primary key autoincrement,
+              position_id integer,
+              signal_id integer,
+              ticker text not null,
+              side text not null check (side in ('BUY','SELL')),
+              qty real not null,
+              order_type text not null check (order_type in ('MARKET','LIMIT','STOP','STOP_LIMIT')),
+              price real,
+              filled_qty real not null default 0,
+              status text not null check (status in ('NEW','SENT','PARTIAL_FILLED','FILLED','CANCELLED','REJECTED','EXPIRED')),
+              broker_order_id text,
+              attempt_no integer not null default 1,
+              sent_at text default current_timestamp,
+              filled_at text,
+              created_at text default current_timestamp
+            )
+            """
+        )
+        cur.execute(
+            """
+            create table if not exists position_events (
+              id integer primary key autoincrement,
+              position_id integer not null,
+              event_time text default current_timestamp,
+              event_type text not null check (event_type in ('ENTRY','ADD','PARTIAL_EXIT','FULL_EXIT','BLOCK')),
+              action text not null check (action in ('EXECUTED','SKIPPED','BLOCKED')),
+              reason_code text not null,
+              detail_json text not null,
+              idempotency_key text unique
+            )
+            """
+        )
+        cur.execute(
+            """
+            create table if not exists risk_state (
+              trade_date text primary key,
+              daily_realized_pnl real not null default 0,
+              daily_unrealized_pnl real not null default 0,
+              daily_loss_limit_hit integer not null default 0,
+              consecutive_losses integer not null default 0,
+              cooldown_until text,
+              trading_enabled integer not null default 1,
+              updated_at text default current_timestamp
+            )
+            """
+        )
+        cur.execute(
+            """
+            create table if not exists parameter_registry (
+              id integer primary key autoincrement,
+              name text unique not null,
+              value_json text not null,
+              scope text not null,
+              tune_required integer not null default 1,
+              target_phase text,
+              rationale text,
+              evidence_link text,
+              updated_at text default current_timestamp
+            )
+            """
+        )
+        cur.execute(
+            """
+            insert or ignore into parameter_registry(name, value_json, scope, tune_required, target_phase, rationale)
+            values('score_weights', '{"impact":0.30,"source_reliability":0.20,"novelty":0.20,"market_reaction":0.15,"liquidity":0.15}', 'global', 0, null, 'v1.2.3 base')
+            """
+        )
+        cur.execute(
+            """
+            insert or ignore into parameter_registry(name, value_json, scope, tune_required, target_phase, rationale)
+            values('retry_policy', '{"max_attempts_per_signal":2,"min_retry_interval_sec":30}', 'global', 0, null, 'v1.2.3 base')
+            """
+        )
+        cur.execute(
+            """
+            insert or ignore into parameter_registry(name, value_json, scope, tune_required, target_phase, rationale)
+            values('exit_policy', '{"time_exit_min":15,"trailing_arm_pct":0.005,"trailing_gap_pct":0.003,"opposite_exit_score_threshold":70}', 'global', 0, null, 'v1.2.3 base')
+            """
+        )
+
+        # lightweight migration for old local sqlite files
+        try:
+            cols = [r[1] for r in self.conn.execute("pragma table_info(orders)").fetchall()]
+            if "filled_qty" not in cols:
+                self.conn.execute("alter table orders add column filled_qty real not null default 0")
+        except Exception:
+            pass
+        try:
+            pcols = [r[1] for r in self.conn.execute("pragma table_info(positions)").fetchall()]
+            if "exited_qty" not in pcols:
+                self.conn.execute("alter table positions add column exited_qty real not null default 0")
+            if "high_watermark" not in pcols:
+                self.conn.execute("alter table positions add column high_watermark real")
+        except Exception:
+            pass
+
+        self.conn.commit()
+
+    def ensure_risk_state_today(self, trade_date: str, autocommit: bool = True) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            insert or ignore into risk_state(trade_date)
+            values(?)
+            """,
+            (trade_date,),
+        )
+        if autocommit:
+            self.conn.commit()
+
+    def get_risk_state(self, trade_date: str) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute("select * from risk_state where trade_date=?", (trade_date,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def apply_realized_pnl(self, trade_date: str, pnl_delta: float, autocommit: bool = True) -> None:
+        self.ensure_risk_state_today(trade_date, autocommit=False)
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            update risk_state
+            set daily_realized_pnl = daily_realized_pnl + ?,
+                consecutive_losses = case
+                    when ? < 0 then consecutive_losses + 1
+                    else 0
+                end,
+                updated_at = current_timestamp
+            where trade_date=?
+            """,
+            (float(pnl_delta or 0.0), float(pnl_delta or 0.0), trade_date),
+        )
+        if autocommit:
+            self.conn.commit()
+
+    def get_parameter(self, name: str) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute("select value_json from parameter_registry where name=?", (name,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row["value_json"])
+        except Exception:
+            return None
+
+    def get_score_weights(self) -> dict[str, float] | None:
+        raw = self.get_parameter("score_weights")
+        if not raw:
+            return None
+        keys = ["impact", "source_reliability", "novelty", "market_reaction", "liquidity"]
+        try:
+            return {k: float(raw[k]) for k in keys}
+        except Exception:
+            return None
+
+    def get_retry_policy(self) -> dict[str, int]:
+        raw = self.get_parameter("retry_policy") or {}
+        try:
+            max_attempts = int(raw.get("max_attempts_per_signal", 2) or 2)
+        except Exception:
+            max_attempts = 2
+        try:
+            min_retry_sec = int(raw.get("min_retry_interval_sec", 30) or 30)
+        except Exception:
+            min_retry_sec = 30
+        return {
+            "max_attempts_per_signal": max(1, max_attempts),
+            "min_retry_interval_sec": max(1, min_retry_sec),
+        }
+
+    def get_exit_policy(self) -> dict[str, float]:
+        raw = self.get_parameter("exit_policy") or {}
+        try:
+            time_exit_min = float(raw.get("time_exit_min", 15) or 15)
+        except Exception:
+            time_exit_min = 15.0
+        try:
+            trailing_arm_pct = float(raw.get("trailing_arm_pct", 0.005) or 0.005)
+        except Exception:
+            trailing_arm_pct = 0.005
+        try:
+            trailing_gap_pct = float(raw.get("trailing_gap_pct", 0.003) or 0.003)
+        except Exception:
+            trailing_gap_pct = 0.003
+        try:
+            opposite_exit_score_threshold = float(raw.get("opposite_exit_score_threshold", 70) or 70)
+        except Exception:
+            opposite_exit_score_threshold = 70.0
+        return {
+            "time_exit_min": max(1.0, time_exit_min),
+            "trailing_arm_pct": max(0.0, trailing_arm_pct),
+            "trailing_gap_pct": max(0.0, trailing_gap_pct),
+            "opposite_exit_score_threshold": max(0.0, opposite_exit_score_threshold),
+        }
+
+    def insert_news_if_new(self, item: dict[str, Any], autocommit: bool = True) -> int | None:
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                """
+                insert into news_events(source,tier,published_at,title,body,url,raw_hash)
+                values(?,?,?,?,?,?,?)
+                """,
+                (
+                    item["source"],
+                    item["tier"],
+                    item["published_at"],
+                    item["title"],
+                    item["body"],
+                    item["url"],
+                    item["raw_hash"],
+                ),
+            )
+            if autocommit:
+                self.conn.commit()
+            return int(cur.lastrowid)
+        except sqlite3.IntegrityError:
+            return None
+
+    def insert_event_ticker(
+        self,
+        news_id: int,
+        ticker: str,
+        company_name: str,
+        confidence: float,
+        method: str,
+        autocommit: bool = True,
+    ) -> int:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            insert into event_tickers(news_id,ticker,company_name,map_confidence,mapping_method)
+            values(?,?,?,?,?)
+            """,
+            (news_id, ticker, company_name, confidence, method),
+        )
+        if autocommit:
+            self.conn.commit()
+        return int(cur.lastrowid)
+
+    def get_event_ticker(self, event_ticker_id: int) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute("select * from event_tickers where id=?", (event_ticker_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def insert_signal(self, payload: dict[str, Any], autocommit: bool = True) -> int:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            insert into signal_scores(news_id,event_ticker_id,ticker,raw_score,total_score,components,priced_in_flag,decision)
+            values(?,?,?,?,?,?,?,?)
+            """,
+            (
+                payload["news_id"],
+                payload["event_ticker_id"],
+                payload["ticker"],
+                payload["raw_score"],
+                payload["total_score"],
+                payload["components"],
+                payload["priced_in_flag"],
+                payload["decision"],
+            ),
+        )
+        if autocommit:
+            self.conn.commit()
+        return int(cur.lastrowid)
+
+    def create_position(self, ticker: str, signal_id: int, qty: float, autocommit: bool = True) -> int:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            insert into positions(ticker,signal_id,status,qty)
+            values(?,?, 'PENDING_ENTRY', ?)
+            """,
+            (ticker, signal_id, qty),
+        )
+        if autocommit:
+            self.conn.commit()
+        return int(cur.lastrowid)
+
+    def set_position_open(self, position_id: int, avg_entry_price: float, opened_value: float, autocommit: bool = True) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            update positions
+            set status='OPEN', avg_entry_price=?, opened_value=?, high_watermark=coalesce(high_watermark, ?)
+            where position_id=? and status='PENDING_ENTRY'
+            """,
+            (avg_entry_price, opened_value, avg_entry_price, position_id),
+        )
+        if cur.rowcount == 0:
+            raise IllegalTransitionError(f"Invalid transition to OPEN for position_id={position_id}")
+        if autocommit:
+            self.conn.commit()
+
+    def set_position_partial_exit(self, position_id: int, exited_qty: float, autocommit: bool = True) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            update positions
+            set status='PARTIAL_EXIT', exited_qty=?
+            where position_id=? and status in ('OPEN','PARTIAL_EXIT')
+            """,
+            (float(exited_qty or 0.0), position_id),
+        )
+        if cur.rowcount == 0:
+            raise IllegalTransitionError(f"Invalid transition to PARTIAL_EXIT for position_id={position_id}")
+        if autocommit:
+            self.conn.commit()
+
+    def update_position_high_watermark(self, position_id: int, price: float, autocommit: bool = True) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            update positions
+            set high_watermark=case
+                when high_watermark is null then ?
+                when ? > high_watermark then ?
+                else high_watermark
+            end
+            where position_id=? and status in ('OPEN','PARTIAL_EXIT')
+            """,
+            (price, price, price, position_id),
+        )
+        if autocommit:
+            self.conn.commit()
+
+    def get_position_high_watermark(self, position_id: int) -> float | None:
+        cur = self.conn.cursor()
+        cur.execute("select high_watermark from positions where position_id=?", (position_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        v = row[0]
+        return float(v) if v is not None else None
+
+    def set_position_closed(self, position_id: int, reason_code: str, exited_qty: float | None = None, autocommit: bool = True) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            update positions
+            set status='CLOSED', closed_at=current_timestamp, exit_reason_code=?, exited_qty=coalesce(?, exited_qty)
+            where position_id=? and status in ('OPEN','PARTIAL_EXIT')
+            """,
+            (reason_code, exited_qty, position_id),
+        )
+        if cur.rowcount == 0:
+            raise IllegalTransitionError(f"Invalid transition to CLOSED for position_id={position_id}")
+        if autocommit:
+            self.conn.commit()
+
+    def set_position_cancelled(self, position_id: int, reason_code: str, autocommit: bool = True) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            update positions
+            set status='CANCELLED', closed_at=current_timestamp, exit_reason_code=?
+            where position_id=? and status='PENDING_ENTRY'
+            """,
+            (reason_code, position_id),
+        )
+        if cur.rowcount == 0:
+            raise IllegalTransitionError(f"Invalid transition to CANCELLED for position_id={position_id}")
+        if autocommit:
+            self.conn.commit()
+
+    def insert_order(
+        self,
+        position_id: int,
+        signal_id: int,
+        ticker: str,
+        side: str,
+        qty: float,
+        order_type: str,
+        status: str,
+        price: float | None,
+        attempt_no: int = 1,
+        autocommit: bool = True,
+    ) -> int:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            insert into orders(position_id,signal_id,ticker,side,qty,order_type,status,price,attempt_no)
+            values(?,?,?,?,?,?,?,?,?)
+            """,
+            (position_id, signal_id, ticker, side, qty, order_type, status, price, int(attempt_no or 1)),
+        )
+        if autocommit:
+            self.conn.commit()
+        return int(cur.lastrowid)
+
+    def update_order_status(
+        self,
+        order_id: int,
+        status: str,
+        broker_order_id: str | None = None,
+        autocommit: bool = True,
+    ) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            update orders
+            set status=?, broker_order_id=coalesce(?, broker_order_id)
+            where id=?
+              and status not in ('FILLED','CANCELLED','REJECTED','EXPIRED')
+            """,
+            (status, broker_order_id, order_id),
+        )
+        if cur.rowcount == 0:
+            chk = self.conn.execute("select status from orders where id=?", (order_id,)).fetchone()
+            current = chk[0] if chk else None
+            if current != status:
+                raise IllegalTransitionError(
+                    f"Invalid order status transition for order_id={order_id}: {current} -> {status}"
+                )
+        if autocommit:
+            self.conn.commit()
+
+    def update_order_partial(
+        self,
+        order_id: int,
+        price: float,
+        filled_qty: float,
+        broker_order_id: str | None = None,
+        autocommit: bool = True,
+    ) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            update orders
+            set status='PARTIAL_FILLED',
+                price=?,
+                filled_qty=case when ? > filled_qty then ? else filled_qty end,
+                broker_order_id=coalesce(?, broker_order_id)
+            where id=? and status in ('NEW','SENT','PARTIAL_FILLED')
+            """,
+            (price, float(filled_qty or 0.0), float(filled_qty or 0.0), broker_order_id, order_id),
+        )
+        if cur.rowcount == 0:
+            raise IllegalTransitionError(f"Invalid transition to PARTIAL_FILLED for order_id={order_id}")
+        if autocommit:
+            self.conn.commit()
+
+    def update_order_filled(
+        self,
+        order_id: int,
+        price: float,
+        filled_qty: float | None = None,
+        broker_order_id: str | None = None,
+        autocommit: bool = True,
+    ) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            update orders
+            set status='FILLED',
+                price=?,
+                filled_qty=coalesce(?, qty),
+                filled_at=current_timestamp,
+                broker_order_id=coalesce(?, broker_order_id)
+            where id=? and status in ('NEW','SENT','PARTIAL_FILLED')
+            """,
+            (price, filled_qty, broker_order_id, order_id),
+        )
+        if cur.rowcount == 0:
+            raise IllegalTransitionError(f"Invalid transition to FILLED for order_id={order_id}")
+        if autocommit:
+            self.conn.commit()
+
+    def get_order_status(self, order_id: int) -> str | None:
+        cur = self.conn.cursor()
+        cur.execute("select status from orders where id=?", (order_id,))
+        row = cur.fetchone()
+        return str(row[0]) if row else None
+
+    def get_order(self, order_id: int) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute("select * from orders where id=?", (order_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_latest_block_reason(self, position_id: int) -> str | None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            select reason_code
+            from position_events
+            where position_id=? and event_type='BLOCK'
+            order by id desc
+            limit 1
+            """,
+            (position_id,),
+        )
+        row = cur.fetchone()
+        return str(row[0]) if row else None
+
+    def get_latest_signal_for_ticker(self, ticker: str) -> dict[str, Any] | None:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            select id, ticker, total_score, decision, created_at
+            from signal_scores
+            where ticker=?
+            order by id desc
+            limit 1
+            """,
+            (ticker,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def count_open_positions(self) -> int:
+        cur = self.conn.cursor()
+        cur.execute("select count(*) from positions where status in ('OPEN','PARTIAL_EXIT')")
+        row = cur.fetchone()
+        return int(row[0] or 0) if row else 0
+
+    def get_open_exposure_for_ticker(self, ticker: str) -> float:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            select coalesce(sum(coalesce(opened_value, 0)), 0)
+            from positions
+            where ticker=? and status in ('OPEN','PARTIAL_EXIT')
+            """,
+            (ticker,),
+        )
+        row = cur.fetchone()
+        return float(row[0] or 0.0) if row else 0.0
+
+    def get_positions_for_exit_scan(self, limit: int = 100) -> list[dict[str, Any]]:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            select p.position_id, p.signal_id, p.ticker, p.qty, p.exited_qty, p.status, p.opened_at, p.avg_entry_price, p.high_watermark,
+                   (
+                     select count(*) from orders o
+                     where o.position_id=p.position_id
+                       and o.side='SELL'
+                       and o.status in ('NEW','SENT','PARTIAL_FILLED')
+                   ) as pending_sell_cnt
+            from positions p
+            where p.status in ('OPEN','PARTIAL_EXIT')
+            order by p.opened_at asc, p.position_id asc
+            limit ?
+            """,
+            (int(limit),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_pending_exit_orders(self, limit: int = 100) -> list[dict[str, Any]]:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            select o.id as order_id, o.position_id, o.signal_id, o.ticker, o.side, o.qty, o.status, o.broker_order_id,
+                   o.attempt_no, o.sent_at,
+                   p.status as position_status, p.qty as position_qty, p.exited_qty
+            from orders o
+            join positions p on p.position_id = o.position_id
+            where p.status in ('OPEN','PARTIAL_EXIT')
+              and o.side='SELL'
+              and o.status in ('NEW','SENT','PARTIAL_FILLED')
+            order by o.sent_at asc, o.id asc
+            limit ?
+            """,
+            (int(limit),),
+        )
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def get_pending_entry_orders(self, limit: int = 100) -> list[dict[str, Any]]:
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            select o.id as order_id, o.position_id, o.signal_id, o.ticker, o.side, o.qty, o.status, o.broker_order_id,
+                   o.attempt_no, o.sent_at,
+                   p.status as position_status
+            from orders o
+            join positions p on p.position_id = o.position_id
+            where p.status='PENDING_ENTRY'
+              and o.side='BUY'
+              and o.status in ('NEW','SENT','PARTIAL_FILLED')
+            order by o.sent_at asc, o.id asc
+            limit ?
+            """,
+            (int(limit),),
+        )
+        rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    def insert_position_event(
+        self,
+        position_id: int,
+        event_type: str,
+        action: str,
+        reason_code: str,
+        detail_json: str,
+        idempotency_key: str | None = None,
+        autocommit: bool = True,
+    ) -> int | None:
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                """
+                insert into position_events(position_id,event_type,action,reason_code,detail_json,idempotency_key)
+                values(?,?,?,?,?,?)
+                """,
+                (position_id, event_type, action, reason_code, detail_json, idempotency_key),
+            )
+            if autocommit:
+                self.conn.commit()
+            return int(cur.lastrowid)
+        except sqlite3.IntegrityError:
+            # idempotency key conflict
+            return None
