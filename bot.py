@@ -4,6 +4,8 @@ import os
 import shlex
 import sys
 import fcntl
+import re
+import pexpect
 from typing import Optional, List
 
 from dotenv import load_dotenv
@@ -30,16 +32,98 @@ GEMINI_APPROVAL_MODE = os.getenv("GEMINI_APPROVAL_MODE", "yolo").strip()  # defa
 GEMINI_SANDBOX = os.getenv("GEMINI_SANDBOX", "true").strip().lower() in ("1", "true", "yes", "on")
 
 AVAILABLE_MODELS = {
-    "gemini-3.1-pro-preview": "Gemini 3.1 Pro (최신)",
-    "gemini-3-flash-preview": "Gemini 3 Flash (속도)",
-    "gemini-1.5-pro": "Gemini 1.5 Pro",
-    "gemini-1.5-flash": "Gemini 1.5 Flash",
+    "auto-gemini-3": "Gemini 3 (자동 최신)",
+    "gemini-3.1-pro-preview": "Gemini 3.1 Pro",
+    "gemini-3-flash-preview": "Gemini 3 Flash",
+    "auto-gemini-2.5": "Gemini 2.5 (자동)",
+    "gemini-2.5-pro": "Gemini 2.5 Pro",
+    "gemini-2.5-flash": "Gemini 2.5 Flash",
 }
 
 TELEGRAM_MAX = 4096
 MSG_CHUNK = 3800
 LOCK_FILE = "/tmp/tg_gemini_bot.lock"
 _lock_fp = None
+
+
+class PersistentGemini:
+    def __init__(self, binary: str, model: Optional[str] = None):
+        self.binary = binary
+        self.model = model
+        self.child: Optional[pexpect.spawn] = None
+        self.lock = asyncio.Lock()
+
+    def _clean_ansi(self, text: str) -> str:
+        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        return ansi_escape.sub('', text)
+
+    async def start(self):
+        async with self.lock:
+            if self.child and self.child.isalive():
+                self.child.terminate(force=True)
+
+            env = os.environ.copy()
+            env["TERM"] = "dumb"
+            env["COLUMNS"] = "100"
+            env["LINES"] = "50"
+            if GEMINI_API_KEY:
+                env["GEMINI_API_KEY"] = GEMINI_API_KEY
+
+            cmd = f"{self.binary} --approval-mode default"
+            if self.model:
+                cmd += f" -m {self.model}"
+            
+            # Interactive mode by default
+            self.child = pexpect.spawn(cmd, env=env, encoding='utf-8', timeout=60)
+            # Wait for initial prompt or some marker
+            try:
+                # Prompt is usually " > " or "Enter your query: "
+                # We'll wait for the block character or some indicator
+                await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self.child.expect([">", "Ready"], timeout=20)
+                )
+            except:
+                pass
+
+    async def query(self, text: str) -> str:
+        async with self.lock:
+            if not self.child or not self.child.isalive():
+                await self.start()
+            
+            self.child.sendline(text)
+            
+            # Use run_in_executor for pexpect synchronous calls
+            def wait_for_response():
+                try:
+                    # Wait for next prompt
+                    self.child.expect([">"], timeout=60)
+                    return self.child.before
+                except pexpect.TIMEOUT:
+                    return self.child.before + "\n[Timeout waiting for prompt]"
+                except Exception as e:
+                    return f"Error: {str(e)}"
+
+            loop = asyncio.get_event_loop()
+            raw_out = await loop.run_in_executor(None, wait_for_response)
+            
+            # Clean up output
+            cleaned = self._clean_ansi(raw_out or "")
+            # Remove the echoed command from the beginning if possible
+            if cleaned.startswith(text):
+                cleaned = cleaned[len(text):].strip()
+            
+            return cleaned.strip() or "(No response)"
+
+    async def restart(self, model: Optional[str] = None):
+        if model:
+            self.model = model
+        await self.start()
+
+    def stop(self):
+        if self.child and self.child.isalive():
+            self.child.terminate(force=True)
+
+persistent_gemini = PersistentGemini(GEMINI_BIN, GEMINI_MODEL_DEFAULT)
 
 
 def _acquire_singleton_lock() -> None:
@@ -74,7 +158,7 @@ def _chunk_text(text: str, size: int = MSG_CHUNK) -> List[str]:
     return chunks
 
 
-async def _run_gemini(prompt: str, model: Optional[str] = None, timeout_sec: int = 45) -> tuple[int, str, str]:
+async def _run_gemini(prompt: str, model: Optional[str] = None, timeout_sec: int = 60) -> tuple[int, str, str]:
     env = os.environ.copy()
     if GEMINI_API_KEY:
         env["GEMINI_API_KEY"] = GEMINI_API_KEY
@@ -135,7 +219,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/help - 도움말\n"
         "/model [name] - 모델 조회/설정\n"
         "/status - 실행 상태\n"
-        "/restart - 봇 프로세스 재기동 안내\n"
+        "/restart - 세션 재시작\n"
+        "/new - 세션 초기화 (대화 기록 삭제)\n"
+        "/input [내용] - CLI로 직접 텍스트 입력 전달\n"
         "/update - Gemini CLI 업데이트\n\n"
         f"현재 모델: `{model}`\n"
         f"Gemini 바이너리: `{GEMINI_BIN}`\n"
@@ -191,7 +277,8 @@ async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     context.application.bot_data["model"] = model
-    await update.message.reply_text(f"✅ 모델 설정 완료: {model}")
+    await persistent_gemini.restart(model=model)
+    await update.message.reply_text(f"✅ 모델 설정 완료 및 세션 재시작: {model}")
 
 
 async def models_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -236,13 +323,31 @@ async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     context.application.bot_data["model"] = model
+    await persistent_gemini.restart(model=model)
     await query.edit_message_text(text=f"✅ 모델이 설정되었습니다: {model}")
 
 
 async def restart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
-    await update.message.reply_text("ℹ️ 이 봇은 요청마다 Gemini를 headless로 실행하므로 별도 세션 재시작이 필요 없습니다.")
+    await update.message.reply_text("🔄 세션 초기화 중...")
+    model = context.application.bot_data.get("model") or GEMINI_MODEL_DEFAULT
+    await persistent_gemini.restart(model=model)
+    await update.message.reply_text("✅ 세션이 재시작되었습니다.")
+
+
+async def input_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text("사용법: /input 1 (도구 승인 등의 입력을 직접 보낼 때 사용)")
+        return
+    
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    out = await persistent_gemini.query(text)
+    for ch in _chunk_text(out):
+        await update.message.reply_text(ch)
 
 
 async def update_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -278,25 +383,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
 
-    model = context.application.bot_data.get("model") or GEMINI_MODEL_DEFAULT or None
-    rc, out, err = await _run_gemini(text, model=model)
-
-    if rc != 0:
-        hint = ""
-        em = (err or out or "")
-        if "ModelNotFoundError" in em or "Requested entity was not found" in em:
-            hint = "\n\n모델명이 잘못됐을 가능성이 큽니다. `/model gemini-2.5-pro`로 변경해 보세요."
-        elif "timeout" in em.lower():
-            hint = "\n\n요청이 오래 걸려 타임아웃됐습니다. 짧은 질문으로 다시 시도해 주세요."
-
-        msg = (
-            "❌ Gemini 실행 실패\n"
-            f"exit={rc}\n"
-            f"stderr:\n{em or '(none)'}{hint}"
-        )
-        for ch in _chunk_text(msg):
-            await update.message.reply_text(ch)
-        return
+    out = await persistent_gemini.query(text)
 
     if not out:
         out = "(응답 없음)"
@@ -319,8 +406,10 @@ async def post_init(app: Application) -> None:
         BotCommand("help", "도움말"),
         BotCommand("model", "모델 수동 설정"),
         BotCommand("models", "모델 선택 (목록)"),
-        BotCommand("status", "상태 확인"),
-        BotCommand("restart", "재시작 안내"),
+        BotCommand("status", "실행 상태"),
+        BotCommand("restart", "세션 재시작"),
+        BotCommand("new", "새 대화 시작"),
+        BotCommand("input", "직접 입력 전달"),
         BotCommand("update", "Gemini CLI 업데이트"),
     ]
     await app.bot.set_my_commands(commands)
@@ -347,6 +436,8 @@ def main() -> None:
     app.add_handler(CommandHandler("models", models_cmd))
     app.add_handler(CallbackQueryHandler(model_callback))
     app.add_handler(CommandHandler("restart", restart_cmd))
+    app.add_handler(CommandHandler("new", restart_cmd))
+    app.add_handler(CommandHandler("input", input_cmd))
     app.add_handler(CommandHandler("update", update_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
