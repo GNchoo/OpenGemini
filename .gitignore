@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+*.log
+stock_trader/trader_env/
