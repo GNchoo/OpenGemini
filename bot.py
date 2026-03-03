@@ -2,6 +2,8 @@
 import asyncio
 import os
 import shlex
+import sys
+import fcntl
 from typing import Optional, List
 
 from dotenv import load_dotenv
@@ -28,6 +30,19 @@ GEMINI_SANDBOX = os.getenv("GEMINI_SANDBOX", "true").strip().lower() in ("1", "t
 
 TELEGRAM_MAX = 4096
 MSG_CHUNK = 3800
+LOCK_FILE = "/tmp/tg_gemini_bot.lock"
+_lock_fp = None
+
+
+def _acquire_singleton_lock() -> None:
+    global _lock_fp
+    _lock_fp = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(_lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_fp.write(str(os.getpid()))
+        _lock_fp.flush()
+    except BlockingIOError:
+        raise RuntimeError("Another tg_gemini bot instance is already running")
 
 
 def _authorized(update: Update) -> bool:
@@ -211,6 +226,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text(ch)
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = context.error
+    print(f"[bot error] {err}")
+    if err and "Conflict: terminated by other getUpdates request" in str(err):
+        print("Another polling instance detected. Exiting this process.")
+        os._exit(1)
+
+
 async def post_init(app: Application) -> None:
     commands = [
         BotCommand("start", "봇 시작"),
@@ -231,7 +254,11 @@ def main() -> None:
     if not os.path.exists(GEMINI_BIN):
         raise RuntimeError(f"GEMINI_BIN not found: {GEMINI_BIN}")
 
+    _acquire_singleton_lock()
+
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
+
+    app.add_error_handler(on_error)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
