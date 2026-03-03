@@ -18,17 +18,21 @@ OpenGemini is a Telegram bot integration for the Gemini CLI and SuperGemini, all
 - Telegram Bot Token
 
 ## Installation
-1. Clone the repository:
+1. Install the `gemini` CLI globally:
+   ```bash
+   npm install -g gemini
+   ```
+2. Clone the repository:
    ```bash
    git clone https://github.com/GNchoo/OpenGemini.git
    cd OpenGemini
    ```
-2. Create and activate a virtual environment:
+3. Create and activate a virtual environment:
    ```bash
    python3 -m venv venv
    source venv/bin/activate
    ```
-3. Install dependencies:
+4. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
