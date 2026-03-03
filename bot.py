@@ -7,12 +7,13 @@ import fcntl
 from typing import Optional, List
 
 from dotenv import load_dotenv
-from telegram import Update, BotCommand
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -22,11 +23,18 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0") or 0)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_BIN = os.getenv("GEMINI_BIN", "/home/linuxbrew/.linuxbrew/bin/gemini").strip()
+GEMINI_BIN = os.getenv("GEMINI_BIN", "/usr/local/share/npm-global/bin/gemini").strip()
 GEMINI_MODEL_DEFAULT = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 GEMINI_WORKDIR = os.getenv("GEMINI_WORKDIR", os.getcwd()).strip()
 GEMINI_APPROVAL_MODE = os.getenv("GEMINI_APPROVAL_MODE", "yolo").strip()  # default|auto_edit|yolo|plan
 GEMINI_SANDBOX = os.getenv("GEMINI_SANDBOX", "true").strip().lower() in ("1", "true", "yes", "on")
+
+AVAILABLE_MODELS = {
+    "gemini-3.1-pro-preview": "Gemini 3.1 Pro (최신)",
+    "gemini-3-flash-preview": "Gemini 3 Flash (속도)",
+    "gemini-1.5-pro": "Gemini 1.5 Pro",
+    "gemini-1.5-flash": "Gemini 1.5 Flash",
+}
 
 TELEGRAM_MAX = 4096
 MSG_CHUNK = 3800
@@ -166,7 +174,7 @@ async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not context.args:
         cur = context.application.bot_data.get("model") or GEMINI_MODEL_DEFAULT or "(기본)"
-        await update.message.reply_text(f"현재 모델: {cur}\n사용법: /model gemini-2.5-pro")
+        await update.message.reply_text(f"현재 모델: {cur}\n사용법: /model gemini-1.5-flash\n다양한 모델을 선택하려면 /models 를 입력하세요.")
         return
 
     model = " ".join(context.args).strip()
@@ -177,13 +185,58 @@ async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         msg = (
             f"❌ 모델 설정 실패: {model}\n"
             f"오류: {(err or out or 'unknown')[:500]}\n"
-            "권장: /model gemini-2.5-pro"
+            "권장: /model gemini-1.5-flash"
         )
         await update.message.reply_text(msg)
         return
 
     context.application.bot_data["model"] = model
     await update.message.reply_text(f"✅ 모델 설정 완료: {model}")
+
+
+async def models_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        return
+
+    keyboard = []
+    # 2열로 배치
+    it = iter(AVAILABLE_MODELS.items())
+    for (m1_id, m1_name) in it:
+        row = [InlineKeyboardButton(m1_name, callback_data=f"set_model:{m1_id}")]
+        try:
+            m2_id, m2_name = next(it)
+            row.append(InlineKeyboardButton(m2_name, callback_data=f"set_model:{m2_id}"))
+        except StopIteration:
+            pass
+        keyboard.append(row)
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    cur = context.application.bot_data.get("model") or GEMINI_MODEL_DEFAULT or "(기본)"
+    await update.message.reply_text(
+        f"현재 모델: `{cur}`\n변경할 모델을 선택하세요:",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def model_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if not data.startswith("set_model:"):
+        return
+
+    model = data.split(":", 1)[1]
+    await query.edit_message_text(text=f"🔄 모델 변경 중: {model}...")
+
+    rc, out, err = await _run_gemini("say verified", model=model, timeout_sec=20)
+    if rc != 0:
+        await query.edit_message_text(f"❌ '{model}' 검증 실패. 다시 시도해 주세요.\nError: {err or out}")
+        return
+
+    context.application.bot_data["model"] = model
+    await query.edit_message_text(text=f"✅ 모델이 설정되었습니다: {model}")
 
 
 async def restart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -264,7 +317,8 @@ async def post_init(app: Application) -> None:
     commands = [
         BotCommand("start", "봇 시작"),
         BotCommand("help", "도움말"),
-        BotCommand("model", "모델 조회/설정"),
+        BotCommand("model", "모델 수동 설정"),
+        BotCommand("models", "모델 선택 (목록)"),
         BotCommand("status", "상태 확인"),
         BotCommand("restart", "재시작 안내"),
         BotCommand("update", "Gemini CLI 업데이트"),
@@ -290,6 +344,8 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("model", model_cmd))
+    app.add_handler(CommandHandler("models", models_cmd))
+    app.add_handler(CallbackQueryHandler(model_callback))
     app.add_handler(CommandHandler("restart", restart_cmd))
     app.add_handler(CommandHandler("update", update_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
