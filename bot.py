@@ -23,6 +23,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_BIN = os.getenv("GEMINI_BIN", "/home/linuxbrew/.linuxbrew/bin/gemini").strip()
 GEMINI_MODEL_DEFAULT = os.getenv("GEMINI_MODEL", "")
 GEMINI_WORKDIR = os.getenv("GEMINI_WORKDIR", os.getcwd()).strip()
+GEMINI_APPROVAL_MODE = os.getenv("GEMINI_APPROVAL_MODE", "yolo").strip()  # default|auto_edit|yolo|plan
+GEMINI_SANDBOX = os.getenv("GEMINI_SANDBOX", "true").strip().lower() in ("1", "true", "yes", "on")
 
 TELEGRAM_MAX = 4096
 MSG_CHUNK = 3800
@@ -57,7 +59,17 @@ async def _run_gemini(prompt: str, model: Optional[str] = None) -> tuple[int, st
     cmd = [GEMINI_BIN]
     if model:
         cmd += ["-m", model]
-    cmd += ["-p", prompt, "--output-format", "text"]
+
+    # 비대화형 + 확인창 차단(텔레그램 봇에서 멈춤 방지)
+    cmd += [
+        "--approval-mode", GEMINI_APPROVAL_MODE,
+        "--output-format", "text",
+    ]
+    if GEMINI_SANDBOX:
+        cmd += ["--sandbox"]
+
+    # headless prompt
+    cmd += ["-p", prompt]
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -97,6 +109,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/update - Gemini CLI 업데이트\n\n"
         f"현재 모델: `{model}`\n"
         f"Gemini 바이너리: `{GEMINI_BIN}`\n"
+        f"approval_mode: `{GEMINI_APPROVAL_MODE}`\n"
+        f"sandbox: `{GEMINI_SANDBOX}`\n"
         f"작업 디렉토리: `{GEMINI_WORKDIR}`"
     )
     await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
