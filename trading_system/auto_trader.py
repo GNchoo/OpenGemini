@@ -1429,7 +1429,7 @@ if __name__ == "__main__":
     ws_simulate = None if ws_sim is None else ws_sim.lower() in ("1", "true", "yes", "on")
 
     trader = AutoTrader(
-        symbols=["KRW-BTC", "KRW-ETH", "KRW-XRP"],
+        symbols=["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL", "KRW-ADA", "KRW-DOGE", "KRW-DOT", "KRW-LINK", "KRW-POL", "KRW-AVAX"],
         paper_mode=mode,
         ws_simulate=ws_simulate,
     )
