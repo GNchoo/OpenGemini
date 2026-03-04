@@ -69,10 +69,24 @@ async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not context.args:
-        await update.message.reply_text(f"현재 모델: {llm.get_model()}\n사용법: /model gemini-2.5-pro")
+        await update.message.reply_text(f"현재 모델: {llm.get_model()}\n사용법: /model auto-gemini-3")
         return
 
     new_model = " ".join(context.args).strip()
+    # 경량 검증: 실제 CLI로 1회 실행 테스트
+    import subprocess
+    proc = subprocess.run(
+        [llm.gemini_bin, "-m", new_model, "-p", "ok"],
+        capture_output=True,
+        text=True,
+        timeout=45,
+        check=False,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "model check failed").strip()[:400]
+        await update.message.reply_text(f"❌ 모델 검증 실패: {new_model}\n{err}")
+        return
+
     llm.set_model(new_model)
     await update.message.reply_text(f"✅ 모델 변경: {new_model}")
 
@@ -83,12 +97,14 @@ async def models_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "추천 모델:\n"
+        "현재 gemini-cli에서 사용 가능한(검증된) 모델:\n"
+        "- auto-gemini-3\n"
+        "- gemini-3.1-pro-preview\n"
+        "- gemini-3-flash-preview\n"
+        "- auto-gemini-2.5\n"
         "- gemini-2.5-pro\n"
-        "- gemini-2.5-flash\n"
-        "- gemini-1.5-pro\n"
-        "- gemini-1.5-flash\n\n"
-        "변경 예시: /model gemini-2.5-pro"
+        "- gemini-2.5-flash\n\n"
+        "변경 예시: /model auto-gemini-3"
     )
 
 
