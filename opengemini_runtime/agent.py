@@ -1,4 +1,5 @@
 import json
+import os
 from typing import Dict, Any
 
 
@@ -9,8 +10,17 @@ class Agent:
         self.memory = memory
         self.tools = tools
         self.destructive_tools = {"write_file", "edit_replace"}
+        self.require_approval_writes = os.getenv("REQUIRE_APPROVAL_WRITES", "false").lower() in ("1", "true", "yes", "on")
 
     def _call_tool(self, user_id: str, tool: str, args: Dict[str, Any]) -> str:
+        # LLM이 자주 쓰는 키 별칭 정규화
+        if "file_path" in args and "path" not in args:
+            args["path"] = args["file_path"]
+        if "old_text" in args and "old" not in args:
+            args["old"] = args["old_text"]
+        if "new_text" in args and "new" not in args:
+            args["new"] = args["new_text"]
+
         if tool == "list_dir":
             return self.tools.list_dir(args.get("path", "."))
         if tool == "read_file":
@@ -54,7 +64,7 @@ class Agent:
                 tool = action.get("tool")
                 args = action.get("args", {})
 
-                if tool in self.destructive_tools:
+                if tool in self.destructive_tools and self.require_approval_writes:
                     req_id = self.sessions.create_approval(user_id, tool, args)
                     text = (
                         f"승인 필요: {tool} {args}\n"
