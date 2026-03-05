@@ -819,6 +819,23 @@ def _update_env_key(engine_type: str, key: str) -> bool:
     except:
         return False
 
+def _get_workspace_state(workdir: str) -> dict:
+    """Return {absolute_path: mtime} for files under workdir."""
+    state = {}
+    try:
+        for root, dirs, files in os.walk(workdir):
+            # prune noisy dirs
+            dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", ".sessions"}]
+            for name in files:
+                path = os.path.join(root, name)
+                try:
+                    state[path] = os.path.getmtime(path)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return state
+
 async def _upload_changes(update: Update, context: ContextTypes.DEFAULT_TYPE, old_state: dict, workdir: str):
     new_state = _get_workspace_state(workdir)
     for path, mtime in new_state.items():
