@@ -284,9 +284,13 @@ class ClaudeAgentEngine(BaseAgentEngine):
             
             args = [
                 self.binary, "-p", text,
-                "--dangerously-skip-permissions", "Bash,Edit,Read",
-                "--permission-mode", "bypassPermissions"
             ]
+            
+            if self.approval_mode == "yolo":
+                args.extend([
+                    "--dangerously-skip-permissions", "Bash,Edit,Read",
+                    "--permission-mode", "bypassPermissions"
+                ])
             
             if use_resume:
                 args.extend(["--resume", self.session_id])
