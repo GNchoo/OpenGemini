@@ -36,6 +36,10 @@ GEMINI_SANDBOX = os.getenv("GEMINI_SANDBOX", "true").strip().lower() in ("1", "t
 CLAUDE_BIN = os.getenv("CLAUDE_BIN", "/home/fallman/.npm-global/bin/claude").strip()
 DEFAULT_ENGINE = os.getenv("DEFAULT_ENGINE", "gemini").lower()
 MSG_CHUNK = 3500
+ENGINE_EXEC_TIMEOUT_SEC = int(os.getenv("ENGINE_EXEC_TIMEOUT_SEC", "1200") or 1200)
+ENGINE_RESPONSE_TIMEOUT_SEC = int(
+    os.getenv("ENGINE_RESPONSE_TIMEOUT_SEC", str(ENGINE_EXEC_TIMEOUT_SEC + 120)) or (ENGINE_EXEC_TIMEOUT_SEC + 120)
+)
 SESSION_DIR = os.path.join(GEMINI_WORKDIR, ".sessions")
 LOCK_FILE = os.path.join(GEMINI_WORKDIR, ".bot.lock")
 os.makedirs(SESSION_DIR, exist_ok=True)
@@ -165,7 +169,7 @@ class GeminiAgentEngine(BaseAgentEngine):
             try:
                 # Use pexpect.run for single-shot headless execution
                 output, exitstatus = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: pexpect.run(cmd, env=env, encoding='utf-8', timeout=180, withexitstatus=True)
+                    None, lambda: pexpect.run(cmd, env=env, encoding='utf-8', timeout=ENGINE_EXEC_TIMEOUT_SEC, withexitstatus=True)
                 )
                 
                 # Extract JSON from output (Enhanced)
@@ -307,7 +311,7 @@ class ClaudeAgentEngine(BaseAgentEngine):
             
             try:
                 output, exitstatus = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: pexpect.run(cmd, env=env, encoding='utf-8', timeout=180, withexitstatus=True, cwd=actual_workdir)
+                    None, lambda: pexpect.run(cmd, env=env, encoding='utf-8', timeout=ENGINE_EXEC_TIMEOUT_SEC, withexitstatus=True, cwd=actual_workdir)
                 )
                 
                 cleaned = self._clean_ansi(output or "").strip()
@@ -768,12 +772,12 @@ async def command_proxy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
     try:
-        async with asyncio.timeout(180):
+        async with asyncio.timeout(300):
             async with RUN_LOCK:
                 out = await engine.query(full_cmd)
     except TimeoutError:
         engine.stop()
-        out = "⏳ 요청 처리 시간이 초과되어 엔진을 재시작했습니다. 다시 시도해주세요."
+        out = "⏳ 요청 처리 시간이 초과(300초)되어 엔진을 재시작했습니다. 다시 시도해주세요."
     await _respond_with_engine_output(update, engine, out)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -821,12 +825,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
 
     try:
-        async with asyncio.timeout(180):
+        async with asyncio.timeout(300):
             async with RUN_LOCK:
                 out = await engine.query(text)
     except TimeoutError:
         engine.stop()
-        out = "⏳ 응답이 지연되어 엔진을 재시작했습니다. 같은 메시지를 한 번 더 보내주세요."
+        out = "⏳ 응답이 지연(300초 초과)되어 엔진을 재시작했습니다. 같은 메시지를 한 번 더 보내주세요."
     await _respond_with_engine_output(update, engine, out)
 
     # 2. Upload any new or modified files
