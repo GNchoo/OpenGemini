@@ -1032,9 +1032,35 @@ async def restart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def update_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
-    await update.message.reply_text("🔄 업데이트 확인 중...")
-    # Add dummy/placeholder for now to keep the flow
-    await update.message.reply_text("✅ 엔진 바이너리가 최신 상태입니다.")
+    keyboard = [
+        [
+            InlineKeyboardButton("🔷 Gemini CLI", callback_data="do_update:gemini"),
+            InlineKeyboardButton("🟣 Claude Code", callback_data="do_update:claude"),
+        ],
+        [InlineKeyboardButton("🔄 둘 다 업데이트", callback_data="do_update:both")],
+    ]
+    await update.message.reply_text(
+        "🔄 *업데이트할 CLI를 선택하세요:*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def _run_npm_update(package: str) -> tuple[bool, str]:
+    """npm install -g <package> 를 실행하고 (성공여부, 출력) 반환."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "npm", "install", "-g", package,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=180)
+        output = stdout.decode(errors="replace").strip() if stdout else ""
+        return proc.returncode == 0, output
+    except asyncio.TimeoutError:
+        return False, "⏳ 180초 시간 초과"
+    except Exception as e:
+        return False, str(e)
 
 
 async def coding_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1434,6 +1460,37 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await query.edit_message_text(manual_msg, parse_mode=ParseMode.MARKDOWN)
         return
 
+    # Handle Update Selection
+    if data.startswith("do_update:"):
+        target = data.split(":")[1]  # "gemini" | "claude" | "both"
+
+        targets = []
+        if target in ("gemini", "both"):
+            targets.append(("gemini", "@google/gemini-cli"))
+        if target in ("claude", "both"):
+            targets.append(("claude", "@anthropic-ai/claude-code"))
+
+        label = {"gemini": "Gemini CLI", "claude": "Claude Code", "both": "Gemini CLI + Claude Code"}[target]
+        await query.edit_message_text(f"🔄 *{label}* 업데이트 중입니다... (최대 3분 소요)", parse_mode=ParseMode.MARKDOWN)
+
+        results = []
+        for name, pkg in targets:
+            ok, out = await _run_npm_update(pkg)
+            # 버전 라인만 추출 (added X.Y.Z 또는 changed X.Y.Z)
+            version_line = next(
+                (l.strip() for l in out.splitlines() if any(k in l for k in ("added", "changed", "updated", "up to date"))),
+                out.splitlines()[-1] if out.splitlines() else "출력 없음"
+            )
+            icon = "✅" if ok else "❌"
+            results.append(f"{icon} *{name.capitalize()}*: `{version_line}`")
+
+        result_text = "\n".join(results)
+        await query.edit_message_text(
+            f"🔄 업데이트 완료!\n\n{result_text}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
     if not data.startswith("tool_approval:"):
         return
     
@@ -1515,7 +1572,7 @@ def main() -> None:
     app.add_handler(CommandHandler("model", model_cmd))
     
     # Callback Query Handlers
-    app.add_handler(CallbackQueryHandler(approval_callback, pattern="^(tool_approval:|set_ws:|set_engine:|auth_method:|set_model:)"))
+    app.add_handler(CallbackQueryHandler(approval_callback, pattern="^(tool_approval:|set_ws:|set_engine:|auth_method:|set_model:|do_update:)"))
 
     # Message Handlers
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
