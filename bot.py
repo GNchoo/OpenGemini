@@ -45,79 +45,192 @@ ENGINE_RESPONSE_TIMEOUT_SEC = int(
 SESSION_DIR = os.path.join(GEMINI_WORKDIR, ".sessions")
 LOCK_FILE = os.path.join(GEMINI_WORKDIR, ".bot.lock")
 SHARED_SESSION_DIR = os.path.expanduser("~/.opengemini/sessions")
+MEMORY_DIR = os.path.expanduser("~/.opengemini/memory")
 os.makedirs(SESSION_DIR, exist_ok=True)
 os.makedirs(SHARED_SESSION_DIR, exist_ok=True)
+os.makedirs(MEMORY_DIR, exist_ok=True)
+
+# 토큰 추정: 영문 4자=1토큰, 한글 1.5자=1토큰 (근사치)
+def _estimate_tokens(text: str) -> int:
+    korean = sum(1 for c in text if '\uAC00' <= c <= '\uD7A3')
+    others = len(text) - korean
+    return int(korean / 1.5 + others / 4)
+
+COMPACTION_TOKEN_THRESHOLD = int(os.getenv("COMPACTION_TOKEN_THRESHOLD", "6000"))
+COMPACTION_KEEP_RECENT = int(os.getenv("COMPACTION_KEEP_RECENT", "6"))  # 압축 후 보존할 최근 turn 수
+
 
 class SharedSessionHistory:
-    """엔진 간 공유 대화 기록 관리 클래스"""
-    
+    """
+    OpenClaw 스타일 3계층 메모리 시스템:
+      1. Transcript  — 전체 대화 JSONL (append-only)
+      2. Compaction  — 토큰 임계치 초과 시 오래된 대화를 요약으로 압축 (영구 저장)
+      3. MEMORY.md   — 장기 메모리 파일, 매 쿼리 시 시스템 프롬프트로 자동 주입
+    """
+
     def __init__(self, chat_id: int):
         self.chat_id = chat_id
-        self.history_file = os.path.join(SHARED_SESSION_DIR, f"{chat_id}.jsonl")
-        self.max_history = 50  # 최대 저장 대화 수
-        
+        self.transcript_file = os.path.join(SHARED_SESSION_DIR, f"{chat_id}.jsonl")
+        self.memory_file = os.path.join(MEMORY_DIR, f"{chat_id}_MEMORY.md")
+        self._compaction_running = False
+
+    # ── 1. Transcript ──────────────────────────────────────────────────────────
+
     def add_message(self, role: str, content: str, engine: str = "unknown"):
-        """대화 기록 추가"""
+        """대화 1턴을 transcript에 append."""
         entry = {
-            "timestamp": time.time(),
-            "role": role,  # "user" or "assistant"
+            "ts": time.time(),
+            "role": role,        # "user" | "assistant" | "compaction"
             "content": content,
-            "engine": engine
+            "engine": engine,
         }
         try:
-            with open(self.history_file, "a", encoding="utf-8") as f:
+            with open(self.transcript_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception as e:
-            print(f"[SharedSessionHistory] Failed to save history: {e}")
-    
-    def get_recent_history(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """최근 대화 기록 조회"""
-        if not os.path.exists(self.history_file):
+            print(f"[Memory] transcript write failed: {e}")
+
+    def _load_transcript(self) -> List[Dict[str, Any]]:
+        if not os.path.exists(self.transcript_file):
             return []
-        
+        entries = []
         try:
-            with open(self.history_file, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-            
-            # 최근 limit개만 반환
-            recent = []
-            for line in lines[-limit:]:
-                try:
-                    recent.append(json.loads(line.strip()))
-                except:
-                    continue
-            
-            return recent
+            with open(self.transcript_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            entries.append(json.loads(line))
+                        except Exception:
+                            pass
         except Exception as e:
-            print(f"[SharedSessionHistory] Failed to load history: {e}")
-            return []
-    
-    def get_formatted_history(self, limit: int = 5) -> str:
-        """프롬프트에 삽입할 형식의 대화 기록 반환"""
-        history = self.get_recent_history(limit)
-        if not history:
+            print(f"[Memory] transcript read failed: {e}")
+        return entries
+
+    # ── 2. Compaction ──────────────────────────────────────────────────────────
+
+    def needs_compaction(self) -> bool:
+        """현재 transcript의 추정 토큰이 임계치를 넘으면 True."""
+        entries = self._load_transcript()
+        total = sum(_estimate_tokens(e.get("content", "")) for e in entries)
+        return total > COMPACTION_TOKEN_THRESHOLD
+
+    def compact(self, summary: str):
+        """
+        오래된 대화를 summary 1개 항목으로 교체하고,
+        최근 COMPACTION_KEEP_RECENT 턴만 원본으로 보존.
+        """
+        entries = self._load_transcript()
+        if len(entries) <= COMPACTION_KEEP_RECENT:
+            return
+
+        keep = entries[-COMPACTION_KEEP_RECENT:]
+        compaction_entry = {
+            "ts": time.time(),
+            "role": "compaction",
+            "content": summary,
+            "engine": "system",
+            "covers_turns": len(entries) - COMPACTION_KEEP_RECENT,
+        }
+        new_entries = [compaction_entry] + keep
+        try:
+            with open(self.transcript_file, "w", encoding="utf-8") as f:
+                for e in new_entries:
+                    f.write(json.dumps(e, ensure_ascii=False) + "\n")
+            print(f"[Memory] compacted {compaction_entry['covers_turns']} turns → summary")
+        except Exception as e:
+            print(f"[Memory] compaction write failed: {e}")
+
+    # ── 3. MEMORY.md ───────────────────────────────────────────────────────────
+
+    def get_long_term_memory(self) -> str:
+        """MEMORY.md 내용 반환. 없으면 빈 문자열."""
+        if not os.path.exists(self.memory_file):
             return ""
-        
-        formatted = []
-        for entry in history:
-            role = entry.get("role", "unknown")
-            content = entry.get("content", "")
-            engine = entry.get("engine", "unknown")
-            
-            if role == "user":
-                formatted.append(f"User: {content}")
-            elif role == "assistant":
-                formatted.append(f"Assistant ({engine}): {content}")
-        
-        return "\n".join(formatted) + "\n\n"
-    
-    def clear_history(self):
-        """대화 기록 초기화"""
         try:
-            if os.path.exists(self.history_file):
-                os.remove(self.history_file)
+            with open(self.memory_file, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            return ""
+
+    def save_long_term_memory(self, content: str):
+        """MEMORY.md 덮어쓰기."""
+        try:
+            with open(self.memory_file, "w", encoding="utf-8") as f:
+                f.write(content.strip() + "\n")
         except Exception as e:
-            print(f"[SharedSessionHistory] Failed to clear history: {e}")
+            print(f"[Memory] MEMORY.md write failed: {e}")
+
+    def append_long_term_memory(self, note: str):
+        """MEMORY.md에 항목 추가 (날짜 태그 포함)."""
+        date_str = time.strftime("%Y-%m-%d")
+        line = f"- [{date_str}] {note.strip()}\n"
+        try:
+            with open(self.memory_file, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception as e:
+            print(f"[Memory] MEMORY.md append failed: {e}")
+
+    # ── 4. 프롬프트 조립 ────────────────────────────────────────────────────────
+
+    def build_context_prompt(self, user_text: str) -> str:
+        """
+        [MEMORY.md] + [compaction summary] + [recent turns] + [현재 질문]
+        을 하나의 프롬프트로 조립.
+        """
+        parts: List[str] = []
+
+        # (A) 장기 메모리
+        ltm = self.get_long_term_memory()
+        if ltm:
+            parts.append(f"[장기 기억 (MEMORY)]\n{ltm}")
+
+        # (B) transcript: compaction + recent turns
+        entries = self._load_transcript()
+        if entries:
+            conv_lines: List[str] = []
+            for e in entries:
+                role = e.get("role", "")
+                content = e.get("content", "")
+                engine = e.get("engine", "")
+                if role == "compaction":
+                    conv_lines.append(f"[이전 대화 요약]\n{content}")
+                elif role == "user":
+                    conv_lines.append(f"User: {content}")
+                elif role == "assistant":
+                    conv_lines.append(f"Assistant ({engine}): {content}")
+            if conv_lines:
+                parts.append("[대화 기록]\n" + "\n".join(conv_lines))
+
+        if not parts:
+            return user_text
+
+        context = "\n\n".join(parts)
+        return (
+            f"{context}\n\n"
+            f"[현재 질문]\n{user_text}\n\n"
+            "위 대화 기록과 기억을 참고하여 답변해주세요:"
+        )
+
+    # ── 5. 초기화 ──────────────────────────────────────────────────────────────
+
+    def clear_history(self):
+        """transcript 초기화 (MEMORY.md는 유지)."""
+        try:
+            if os.path.exists(self.transcript_file):
+                os.remove(self.transcript_file)
+            print(f"[Memory] transcript cleared for chat_id={self.chat_id}")
+        except Exception as e:
+            print(f"[Memory] clear failed: {e}")
+
+    def clear_all(self):
+        """transcript + MEMORY.md 모두 초기화."""
+        self.clear_history()
+        try:
+            if os.path.exists(self.memory_file):
+                os.remove(self.memory_file)
+        except Exception as e:
+            print(f"[Memory] MEMORY.md clear failed: {e}")
 
 
 class BaseAgentEngine:
@@ -213,6 +326,50 @@ class BaseAgentEngine:
         if self.auth_child and self.auth_child.isalive():
             self.auth_child.terminate(force=True)
 
+    async def _run_compaction(self):
+        """
+        오래된 대화를 LLM에게 요약시켜 compaction 수행.
+        현재 엔진(self)을 재귀 호출하지 않도록 직접 subprocess 실행.
+        """
+        self.shared_history._compaction_running = True
+        try:
+            entries = self.shared_history._load_transcript()
+            to_summarize = entries[:-COMPACTION_KEEP_RECENT]
+            if not to_summarize:
+                return
+
+            lines = []
+            for e in to_summarize:
+                role = e.get("role", "")
+                content = e.get("content", "")
+                engine = e.get("engine", "")
+                if role == "compaction":
+                    lines.append(f"[이전 요약] {content}")
+                elif role == "user":
+                    lines.append(f"User: {content}")
+                elif role == "assistant":
+                    lines.append(f"Assistant ({engine}): {content}")
+
+            conversation_text = "\n".join(lines)
+            summary_prompt = (
+                "다음 대화를 핵심 사실, 결정 사항, 중요한 맥락 위주로 간결하게 요약해줘. "
+                "불필요한 인사나 잡담은 제외하고, 이후 대화에서 참고할 수 있을 만한 내용만 남겨줘.\n\n"
+                f"{conversation_text}"
+            )
+
+            print(f"[Memory] running compaction for chat_id={self.chat_id} ({len(to_summarize)} turns)")
+            summary = await self.query_raw(summary_prompt)
+            if summary:
+                self.shared_history.compact(summary)
+        except Exception as e:
+            print(f"[Memory] compaction failed: {e}")
+        finally:
+            self.shared_history._compaction_running = False
+
+    async def query_raw(self, text: str) -> str:
+        """컨텍스트 주입 없이 순수 텍스트만으로 엔진에 질의 (compaction 전용)."""
+        raise NotImplementedError
+
 class GeminiAgentEngine(BaseAgentEngine):
     def __init__(self, chat_id: int, binary: str, model: Optional[str] = None):
         super().__init__(chat_id, binary, model)
@@ -226,23 +383,16 @@ class GeminiAgentEngine(BaseAgentEngine):
         print(f"[GeminiAgentEngine] Headless engine ready for {self.session_id}")
 
     async def query(self, text: str) -> str:
-        # 1. 사용자 메시지를 공유 기록에 저장
+        # 1. 사용자 메시지 저장
         self.shared_history.add_message("user", text, self.engine_name)
-        
-        # 2. 이전 대화 기록 가져오기 (최근 3개)
-        history_context = self.shared_history.get_formatted_history(limit=3)
-        
-        # 3. 프롬프트에 이전 대화 포함
-        enhanced_prompt = ""
-        if history_context:
-            enhanced_prompt = f"""이전 대화 기록:
-{history_context}
-현재 질문: {text}
 
-위의 대화 기록을 참고하여 답변해주세요:"""
-        else:
-            enhanced_prompt = text
-        
+        # 2. compaction 필요 시 비동기 처리 (이번 쿼리는 원본 그대로 진행)
+        if self.shared_history.needs_compaction() and not self.shared_history._compaction_running:
+            asyncio.get_event_loop().create_task(self._run_compaction())
+
+        # 3. 전체 컨텍스트 프롬프트 조립 (MEMORY + transcript + 현재 질문)
+        enhanced_prompt = self.shared_history.build_context_prompt(text)
+
         async with self.lock:
             # We run a fresh process per query using --resume latest
             env = os.environ.copy()
@@ -344,6 +494,39 @@ class GeminiAgentEngine(BaseAgentEngine):
     async def finish_auth_oauth(self, code: str) -> str:
         return "ℹ️ Gemini CLI는 별도의 인증 코드 입력이 필요하지 않습니다."
 
+    async def query_raw(self, text: str) -> str:
+        """컨텍스트 주입 없이 순수 텍스트로 Gemini에 질의 (compaction 전용)."""
+        env = os.environ.copy()
+        env["TERM"] = "dumb"
+        env["NO_COLOR"] = "1"
+        if GEMINI_API_KEY:
+            env["GEMINI_API_KEY"] = GEMINI_API_KEY
+        args = [self.binary, "-p", text, "--approval-mode", "yolo", "--output-format", "json"]
+        if self.model:
+            args.extend(["-m", self.model])
+        cmd = " ".join(shlex.quote(a) for a in args)
+        try:
+            output, _ = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: pexpect.run(cmd, env=env, encoding="utf-8", timeout=120, withexitstatus=True)
+            )
+            decoder = json.JSONDecoder()
+            idx = 0
+            while idx < len(output):
+                idx = output.find("{", idx)
+                if idx == -1:
+                    break
+                try:
+                    obj, end_idx = decoder.raw_decode(output[idx:])
+                    found = obj.get("response") or (obj.get("summary") or {}).get("totalResponse")
+                    if found:
+                        return str(found).strip()
+                    idx += end_idx
+                except json.JSONDecodeError:
+                    idx += 1
+        except Exception as e:
+            print(f"[Memory] Gemini query_raw failed: {e}")
+        return ""
+
 class ClaudeAgentEngine(BaseAgentEngine):
     def __init__(self, chat_id: int, binary: str, model: Optional[str] = None):
         super().__init__(chat_id, binary, model)
@@ -373,23 +556,16 @@ class ClaudeAgentEngine(BaseAgentEngine):
 
     async def query(self, text: str) -> str:
         """One-shot query using --resume if session exists, else --session-id."""
-        # 1. 사용자 메시지를 공유 기록에 저장
+        # 1. 사용자 메시지 저장
         self.shared_history.add_message("user", text, self.engine_name)
-        
-        # 2. 이전 대화 기록 가져오기 (최근 3개)
-        history_context = self.shared_history.get_formatted_history(limit=3)
-        
-        # 3. 프롬프트에 이전 대화 포함
-        enhanced_prompt = ""
-        if history_context:
-            enhanced_prompt = f"""이전 대화 기록:
-{history_context}
-현재 질문: {text}
 
-위의 대화 기록을 참고하여 답변해주세요:"""
-        else:
-            enhanced_prompt = text
-        
+        # 2. compaction 필요 시 비동기 처리
+        if self.shared_history.needs_compaction() and not self.shared_history._compaction_running:
+            asyncio.get_event_loop().create_task(self._run_compaction())
+
+        # 3. 전체 컨텍스트 프롬프트 조립 (MEMORY + transcript + 현재 질문)
+        enhanced_prompt = self.shared_history.build_context_prompt(text)
+
         async with self.lock:
             actual_workdir = self.workdir
             if not actual_workdir.endswith("workspace"):
@@ -525,6 +701,31 @@ class ClaudeAgentEngine(BaseAgentEngine):
                 return "\u23f3 아직 인증이 완료되지 않았습니다.\n\n브라우저에서 로그인을 완료한 후 아무 메시지나 다시 보내주세요."
         except Exception as e:
             return f"\u274c 인증 상태 확인 오류: {e}"
+
+    async def query_raw(self, text: str) -> str:
+        """컨텍스트 주입 없이 순수 텍스트로 Claude에 질의 (compaction 전용)."""
+        actual_workdir = self.workdir
+        if not actual_workdir.endswith("workspace"):
+            actual_workdir = os.path.join(self.workdir, "workspace")
+        os.makedirs(actual_workdir, exist_ok=True)
+        env = os.environ.copy()
+        env["TERM"] = "xterm"
+        env["NO_COLOR"] = "1"
+        args = [self.binary, "-p", text, "--dangerously-skip-permissions",
+                "--session-id", self.session_id, "--output-format", "text"]
+        if self.model:
+            args.extend(["--model", self.model])
+        cmd = " ".join(shlex.quote(a) for a in args)
+        try:
+            output, _ = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: pexpect.run(cmd, env=env, encoding="utf-8", timeout=120,
+                                          withexitstatus=True, cwd=actual_workdir)
+            )
+            cleaned = self._clean_ansi(output or "").strip()
+            return cleaned if cleaned else ""
+        except Exception as e:
+            print(f"[Memory] Claude query_raw failed: {e}")
+            return ""
 
 # 세션 관리 (chat_id별 엔진 인스턴스)
 ENGINES = {} # chat_id -> BaseAgentEngine
@@ -856,16 +1057,54 @@ async def coding_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("💻 *Coding Agent 모드*가 활성화되었습니다.\n이제 프로젝트 분석 및 코드 작성이 가능합니다.", parse_mode=ParseMode.MARKDOWN)
 
 async def clear_history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """공유 대화 기록 초기화"""
+    """대화 기록(transcript) 초기화. MEMORY.md는 유지."""
     if not _authorized(update):
         return
-    
     chat_id = update.effective_chat.id
     engine_type = context.user_data.get("engine", DEFAULT_ENGINE)
     engine = get_engine(chat_id, engine_type)
-    
     engine.shared_history.clear_history()
-    await update.message.reply_text("🧹 *공유 대화 기록이 초기화되었습니다.*\n이제 새로운 대화가 시작됩니다.", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        "🧹 *대화 기록이 초기화되었습니다.*\n장기 메모리(MEMORY)는 유지됩니다.\n새로운 대화를 시작하세요.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def memory_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """장기 메모리(MEMORY.md) 관리.
+    /memory          → 현재 저장된 메모리 조회
+    /memory <내용>   → 메모리에 새 항목 추가
+    /memory clear    → 메모리 전체 삭제
+    """
+    if not _authorized(update):
+        return
+    chat_id = update.effective_chat.id
+    engine_type = context.user_data.get("engine", DEFAULT_ENGINE)
+    engine = get_engine(chat_id, engine_type)
+    sh = engine.shared_history
+
+    args = " ".join(context.args).strip() if context.args else ""
+
+    if not args:
+        # 조회
+        ltm = sh.get_long_term_memory()
+        if ltm:
+            await update.message.reply_text(
+                f"📝 *장기 메모리 (MEMORY.md)*\n\n```\n{ltm}\n```",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text("📭 저장된 장기 메모리가 없습니다.\n`/memory <기억할 내용>` 으로 추가할 수 있습니다.", parse_mode=ParseMode.MARKDOWN)
+
+    elif args.lower() == "clear":
+        sh.save_long_term_memory("")
+        await update.message.reply_text("🗑️ 장기 메모리가 삭제되었습니다.", parse_mode=ParseMode.MARKDOWN)
+
+    else:
+        sh.append_long_term_memory(args)
+        await update.message.reply_text(
+            f"✅ *메모리에 저장되었습니다:*\n`{args}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
 async def auth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
@@ -1230,8 +1469,9 @@ async def post_init(app: Application) -> None:
         BotCommand("coding", "코딩 에이전트 모드 활성화"),
         BotCommand("mode", "승인 모드 설정"),
         BotCommand("status", "에이전트 상태"),
-        BotCommand("new", "세션 및 공유 기록 초기화"),
-        BotCommand("clear", "공유 대화 기록만 초기화"),
+        BotCommand("new", "세션 및 대화 기록 초기화"),
+        BotCommand("clear", "대화 기록만 초기화 (메모리 유지)"),
+        BotCommand("memory", "장기 메모리 조회/추가/삭제"),
         BotCommand("update", "바이너리 업데이트"),
         BotCommand("model", "모델 전환 (Sonnet/Haiku/Opus/Pro/Flash)"),
     ]
@@ -1268,6 +1508,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("new", restart_cmd))
     app.add_handler(CommandHandler("clear", clear_history_cmd))
+    app.add_handler(CommandHandler("memory", memory_cmd))
     app.add_handler(CommandHandler("workspace", workspace_cmd))
     app.add_handler(CommandHandler("coding", coding_cmd))
     app.add_handler(CommandHandler("update", update_cmd))
